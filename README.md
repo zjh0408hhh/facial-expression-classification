@@ -9,6 +9,10 @@
 | `cell_01_write_training_module.txt` | 定义数据处理、模型、五折训练和预测，并写成 Python 脚本 |
 | `cell_02_run_training.py` | 启动训练脚本并显示日志 |
 
+## 数据集
+
+使用 Kaggle 任务提供的人脸表情分类数据。`train/` 包含 28,275 张训练图像，按 6 类表情分目录存放；`test/` 包含 7,065 张测试图像。
+
 ## 在 Kaggle 上运行
 
 1. 在 Kaggle Notebook 中添加比赛数据并启用 GPU。
