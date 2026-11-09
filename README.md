@@ -9,10 +9,6 @@
 | `cell_01_write_training_module.txt` | 定义数据处理、模型、五折训练和预测，并写成 Python 脚本 |
 | `cell_02_run_training.py` | 启动训练脚本并显示日志 |
 
-## 数据集
-
-数据来自 Kaggle 的 `2026task2` 比赛。图片为 48×48 灰度图，训练集按表情类别分目录，测试集包含待预测的图片。将比赛数据挂载到 Notebook 后，代码会从 `/kaggle/input/competitions/2026task2/fer_data/fer_data` 下的 `train/` 和 `test/` 读取图片。
-
 ## 在 Kaggle 上运行
 
 1. 在 Kaggle Notebook 中添加比赛数据并启用 GPU。
