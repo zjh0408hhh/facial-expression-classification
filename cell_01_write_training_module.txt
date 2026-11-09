@@ -1,0 +1,716 @@
+%%writefile /kaggle/working/fer_v3_accuracy.py
+# 人脸表情分类：五折训练、模型集成和测试时增强。
+# 数据路径和提交格式沿用比赛设置。
+
+import os
+import math
+import gc
+import random
+import hashlib
+import warnings
+import json
+import time
+import sys
+import multiprocessing as mp
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from collections import Counter, defaultdict
+
+import cv2
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, get_worker_info
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import accuracy_score, classification_report
+import timm
+from timm.utils import ModelEmaV2
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+
+warnings.filterwarnings("ignore")
+
+# 比赛数据目录和提交文件路径。
+DATA_DIR = '/kaggle/input/competitions/2026task2/fer_data/fer_data'
+TRAIN_DIR = os.path.join(DATA_DIR, 'train')
+TEST_DIR = os.path.join(DATA_DIR, 'test')
+SUBMISSION_PATH = '/kaggle/working/submission.csv'
+
+# 六类表情对应提交文件中的整数标签 0～5。
+CLASS_MAP = {
+    'angry': 0, 'fear': 1, 'happy': 2,
+    'sad': 3, 'surprise': 4, 'neutral': 5,
+}
+INV_MAP = {v: k for k, v in CLASS_MAP.items()}
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png')
+
+# ResNet34 和 B0 为基础模型，B2 作为集成候选。
+SEED = 42
+IMG_SIZE = 48
+NUM_FOLDS = 5
+BATCH_SIZE = 96
+INFER_BATCH_SIZE = 96
+NUM_WORKERS = 2
+MAX_GPU_WORKERS = 2
+EPOCHS = 48
+MIN_EPOCHS = 40
+WARMUP_EPOCHS = 3
+CLEAN_EPOCHS = 8
+PATIENCE = 10
+LABEL_SMOOTHING = 0.03
+MIXUP_ALPHA = 0.2
+TRY_SHIFT_TTA = True
+SHIFT_OFFSETS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+THIRD_MODEL_WEIGHT = 0.20
+SHIFT_BLEND_WEIGHT = 0.25
+MIN_ENSEMBLE_GAIN = 0.001
+MODEL_SPECS = {
+    'resnet34': dict(lr=2e-4, head_lr=1e-3, weight_decay=5e-4,
+                     drop_path=0.10, mixup_p=0.35),
+    'efficientnet_b0': dict(lr=2e-4, head_lr=1e-3, weight_decay=5e-4,
+                     drop_path=0.10, mixup_p=0.35),
+    'efficientnet_b2.ra_in1k': dict(lr=1e-4, head_lr=5e-4, weight_decay=8e-4,
+                     drop_path=0.15, mixup_p=0.50),
+}
+MODEL_NAMES = tuple(MODEL_SPECS)
+WORK_ROOT = Path('/kaggle/working/_fer_v3')
+DEVICE = torch.device('cpu')
+CACHE_DIR = None
+BASE_DIR = None
+STOP_EVENT = None
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def image_hash(path):
+    with open(path, 'rb') as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+
+def load_data(train_dir, test_dir):
+    """Read class folders and deduplicate exact copies by content hash."""
+    grouped = defaultdict(list)
+    indexed_rows = []
+    for cname in sorted(os.listdir(train_dir)):
+        folder = os.path.join(train_dir, cname)
+        if not os.path.isdir(folder):
+            continue
+        key = cname.strip().lower()
+        if key in ('suprise', 'surprize', 'surpirse'):
+            label = CLASS_MAP['surprise']
+        elif key in CLASS_MAP:
+            label = CLASS_MAP[key]
+        else:
+            continue
+        for fname in sorted(os.listdir(folder)):
+            if fname.lower().endswith(IMAGE_EXTS):
+                path = os.path.join(folder, fname)
+                indexed_rows.append((path, label))
+
+    # 并行计算文件哈希时保留排序，避免改变交叉验证划分。
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        hashes = pool.map(image_hash, (row[0] for row in indexed_rows))
+        for h, row in zip(hashes, indexed_rows):
+            grouped[h].append(row)
+
+    train_paths, train_labels, train_hash = [], [], {}
+    duplicate_groups = 0
+    conflicting_groups = 0
+    for h, rows in grouped.items():
+        if len(rows) > 1:
+            duplicate_groups += 1
+        counts = Counter(label for _, label in rows)
+        if len(counts) > 1:
+            conflicting_groups += 1
+        # 完全重复的训练图只保留一张；标签冲突时取出现次数最多的标签。
+        label = counts.most_common(1)[0][0]
+        train_paths.append(rows[0][0])
+        train_labels.append(label)
+        train_hash[h] = label
+
+    test_paths = [
+        os.path.join(test_dir, fname)
+        for fname in sorted(os.listdir(test_dir))
+        if fname.lower().endswith(IMAGE_EXTS)
+    ]
+    test_names = [os.path.basename(path) for path in test_paths]
+
+    print(f'Original training images: {sum(len(v) for v in grouped.values())}')
+    print(f'Deduplicated training images: {len(train_paths)}; duplicate groups: {duplicate_groups}; '
+          f'conflicting-label groups: {conflicting_groups}')
+    print(f'Test images: {len(test_paths)}')
+    counts = Counter(train_labels)
+    print('Deduplicated class counts:')
+    for i in range(6):
+        print(f'  {INV_MAP[i]:<10}: {counts[i]}')
+    return train_paths, train_labels, test_paths, test_names, train_hash
+
+
+
+def make_transform(clean=False):
+    if clean:
+        return A.Compose([
+            A.HorizontalFlip(p=0.5),
+            A.Normalize(mean=(0.5,), std=(0.5,)),
+            ToTensorV2(),
+        ])
+    return A.Compose([
+        A.HorizontalFlip(p=0.5),
+        A.Affine(scale=(0.94, 1.06), translate_percent=(-0.04, 0.04),
+                 rotate=(-10, 10), border_mode=cv2.BORDER_REFLECT_101, p=0.65),
+        A.RandomBrightnessContrast(brightness_limit=0.12, contrast_limit=0.15, p=0.35),
+        A.CLAHE(clip_limit=(1.0, 2.0), tile_grid_size=(4, 4), p=0.15),
+        A.Normalize(mean=(0.5,), std=(0.5,)),
+        ToTensorV2(),
+    ])
+
+
+def eval_transform():
+    return A.Compose([
+        A.Normalize(mean=(0.5,), std=(0.5,)),
+        ToTensorV2(),
+    ])
+
+
+class CachedFERDataset(Dataset):
+    def __init__(self, cache_file, indices, labels=None, transform=None):
+        self.cache_file = str(cache_file)
+        self.indices = np.asarray(indices, dtype=np.int64)
+        self.labels = labels
+        self.transform = transform
+        self.images = None
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state['images'] = None
+        return state
+
+    def __getitem__(self, item):
+        if self.images is None:
+            self.images = np.load(self.cache_file, mmap_mode='r', allow_pickle=False)
+        index = int(self.indices[item])
+        # 直接从缓存取 48×48 灰度图，避免每轮重复解码。
+        image = np.array(self.images[index], copy=True)
+        image = self.transform(image=image)['image']
+        return image, index if self.labels is None else int(self.labels[index])
+
+
+def seed_worker(worker_id):
+    seed = torch.initial_seed() % (2 ** 32)
+    random.seed(seed)
+    np.random.seed(seed)
+    cv2.setNumThreads(0)
+    transform = get_worker_info().dataset.transform
+    if hasattr(transform, 'set_random_seed'):
+        transform.set_random_seed(seed)
+
+
+def make_loader(dataset, training=False):
+    return DataLoader(dataset, batch_size=BATCH_SIZE if training else INFER_BATCH_SIZE,
+        shuffle=training, num_workers=NUM_WORKERS, pin_memory=DEVICE.type == 'cuda',
+        persistent_workers=NUM_WORKERS > 0, worker_init_fn=seed_worker,
+        drop_last=False)
+
+
+class ExpressionModel(nn.Module):
+    def __init__(self, model_name, initialize=True):
+        super().__init__()
+        spec = MODEL_SPECS[model_name]
+        self.backbone = timm.create_model(model_name, pretrained=False, in_chans=3,
+            num_classes=0, global_pool='', drop_path_rate=spec['drop_path'])
+        if initialize:
+            weights = torch.load(BASE_DIR / (model_name + '.pth'),
+                                 map_location='cpu', weights_only=True)
+            self.backbone.load_state_dict(weights)
+        if model_name.startswith('resnet'):
+            self.backbone.conv1.stride = (1, 1)
+            self.backbone.maxpool = nn.Identity()
+        elif model_name.startswith('efficientnet_b'):
+            self.backbone.conv_stem.stride = (1, 1)
+            # 这一层输入输出通道数不同，调整步幅后仍没有残差连接。
+            self.backbone.blocks[1][0].conv_dw.stride = (1, 1)
+        else:
+            raise ValueError(model_name)
+        config = self.backbone.pretrained_cfg
+        self.register_buffer('rgb_mean', torch.tensor(config['mean']).view(1, 3, 1, 1))
+        self.register_buffer('rgb_std', torch.tensor(config['std']).view(1, 3, 1, 1))
+        channels = self.backbone.num_features
+        self.attention = nn.Sequential(nn.Conv2d(channels, 64, 1), nn.ReLU(inplace=True),
+                                       nn.Conv2d(64, 1, 1))
+        nn.init.zeros_(self.attention[-1].weight)
+        nn.init.zeros_(self.attention[-1].bias)
+        self.head = nn.Sequential(nn.Dropout(0.35), nn.Linear(channels, 6))
+
+    def forward(self, images):
+        images = (images * 0.5 + 0.5).expand(-1, 3, -1, -1)
+        images = ((images - self.rgb_mean) / self.rgb_std).contiguous(
+            memory_format=torch.channels_last)
+        features = self.backbone.forward_features(images)
+        weights = self.attention(features).flatten(2).softmax(dim=-1)
+        attended = (features.flatten(2) * weights).sum(dim=-1)
+        pooled = 0.5 * (features.mean(dim=(2, 3)) + attended)
+        return self.head(pooled)
+
+
+def make_optimizer(model, spec):
+    groups = {}
+    for name, parameter in model.named_parameters():
+        lr = spec['lr'] if name.startswith('backbone.') else spec['head_lr']
+        decay = spec['weight_decay'] if parameter.ndim > 1 else 0.0
+        groups.setdefault((lr, decay), []).append(parameter)
+    return torch.optim.AdamW([
+        dict(params=parameters, lr=lr, weight_decay=decay)
+        for (lr, decay), parameters in groups.items()])
+
+
+def amp_context():
+    return torch.amp.autocast(device_type=DEVICE.type, enabled=DEVICE.type == 'cuda')
+
+
+def integer_shift(images, dx, dy):
+    # 用反射边界做一像素平移，输入仍为 48×48，不做插值。
+    if dx == 0 and dy == 0:
+        return images
+    if abs(dx) > 1 or abs(dy) > 1:
+        raise ValueError('Only one-pixel shifts are supported.')
+    height, width = images.shape[-2:]
+    padded = F.pad(images, (1, 1, 1, 1), mode='reflect')
+    return padded[:, :, 1-dy:1-dy+height, 1-dx:1-dx+width]
+
+
+def predict_probs(model, loader, tta=True, shifts=((0, 0),)):
+    if not shifts:
+        raise ValueError('At least one inference view is required.')
+    model.eval()
+    values = []
+    with torch.inference_mode():
+        for images, _ in loader:
+            images = images.to(DEVICE, non_blocking=True)
+            with amp_context():
+                total = None
+                for dx, dy in shifts:
+                    view = integer_shift(images, dx, dy)
+                    probability = model(view).float().softmax(dim=1)
+                    if tta:
+                        probability = 0.5 * (probability + model(
+                            view.flip(3)).float().softmax(dim=1))
+                    total = probability if total is None else total + probability
+                probability = total / len(shifts)
+            values.append(probability.cpu().numpy())
+    return np.concatenate(values).astype(np.float32)
+
+
+def probability_metrics(probability, labels):
+    labels = np.asarray(labels, dtype=np.int64)
+    accuracy = float(np.mean(probability.argmax(axis=1) == labels))
+    nll = float(-np.log(np.clip(probability[np.arange(len(labels)), labels], 1e-8, 1)).mean())
+    return accuracy, nll
+
+
+
+
+
+
+
+
+def init_worker(device_queue, cache_directory, base_directory, stop_event):
+    global DEVICE, CACHE_DIR, BASE_DIR, STOP_EVENT
+    gpu = device_queue.get()
+    if gpu >= 0:
+        torch.cuda.set_device(gpu)
+        DEVICE = torch.device(f'cuda:{gpu}')
+        torch.backends.cudnn.benchmark = True
+    else:
+        DEVICE = torch.device('cpu')
+    torch.set_num_threads(1)
+    cv2.setNumThreads(0)
+    CACHE_DIR, BASE_DIR = Path(cache_directory), Path(base_directory)
+    STOP_EVENT = stop_event
+
+
+def atomic_torch_save(value, destination):
+    temporary = destination.with_suffix('.tmp.pth')
+    torch.save(value, temporary)
+    os.replace(temporary, destination)
+
+
+def train_job(job):
+    if STOP_EVENT is not None and STOP_EVENT.is_set():
+        raise RuntimeError('Another training worker failed; cancelling this job.')
+    model_name, fold, train_indices, valid_indices = job
+    result_path = CACHE_DIR / f'{model_name}_fold{fold}.npz'
+    if result_path.exists():
+        with np.load(result_path, allow_pickle=False) as stored:
+            if np.array_equal(stored['valid_indices'], valid_indices):
+                print(f'{model_name} Fold {fold}: reusing completed result', flush=True)
+                return str(result_path)
+        raise RuntimeError('Cached fold indices disagree; remove this run cache.')
+
+    seed = SEED + fold * 100 + MODEL_NAMES.index(model_name)
+    seed_everything(seed)
+    labels = np.load(CACHE_DIR / 'labels.npy', allow_pickle=False)
+    valid_labels = labels[valid_indices]
+    test_count = len(np.load(CACHE_DIR / 'test.npy', mmap_mode='r', allow_pickle=False))
+    transform = make_transform()
+    if hasattr(transform, 'set_random_seed'):
+        transform.set_random_seed(seed)
+    train_loader = make_loader(CachedFERDataset(
+        CACHE_DIR / 'train.npy', train_indices, labels, transform), True)
+    valid_loader = make_loader(CachedFERDataset(
+        CACHE_DIR / 'train.npy', valid_indices, labels, eval_transform()))
+    test_loader = make_loader(CachedFERDataset(
+        CACHE_DIR / 'test.npy', np.arange(test_count), None, eval_transform()))
+
+    spec = MODEL_SPECS[model_name]
+    model = ExpressionModel(model_name).to(DEVICE, memory_format=torch.channels_last)
+    ema = ModelEmaV2(model, decay=0.995)
+    optimizer = make_optimizer(model, spec)
+    # 先用带标签平滑的交叉熵，收尾阶段改用原始标签；均不加类别权重。
+    criterion = nn.CrossEntropyLoss(label_smoothing=LABEL_SMOOTHING)
+    clean_criterion = nn.CrossEntropyLoss()
+    scaler = torch.amp.GradScaler('cuda', enabled=DEVICE.type == 'cuda')
+    steps_per_epoch = len(train_loader)
+    total_steps = EPOCHS * steps_per_epoch
+    warmup_steps = WARMUP_EPOCHS * steps_per_epoch
+
+    def lr_factor(step):
+        if step < warmup_steps:
+            return 0.1 + 0.9 * step / max(1, warmup_steps)
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.01 + 0.99 * 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_factor)
+    best_accuracy, best_nll = -1.0, float('inf')
+    best_state, best_source, best_epoch = None, None, None
+    wait, updates = 0, 0
+    start = time.monotonic()
+    print(f'{model_name} Fold {fold}: device={DEVICE}, max_epochs={EPOCHS}', flush=True)
+
+    for epoch in range(EPOCHS):
+        epoch_start = time.monotonic()
+        clean = epoch >= EPOCHS - CLEAN_EPOCHS
+        if epoch == EPOCHS - CLEAN_EPOCHS:
+            del train_loader
+            transform = make_transform(clean=True)
+            if hasattr(transform, 'set_random_seed'):
+                transform.set_random_seed(seed + 10000)
+            train_loader = make_loader(CachedFERDataset(
+                CACHE_DIR / 'train.npy', train_indices, labels, transform), True)
+
+        loss_fn = clean_criterion if clean else criterion
+        model.train()
+        loss_sum, count = 0.0, 0
+        for images, targets in train_loader:
+            if STOP_EVENT is not None and STOP_EVENT.is_set():
+                raise RuntimeError('Another training worker failed; cancelling this job.')
+            images = images.to(DEVICE, non_blocking=True)
+            targets = targets.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            mixup = not clean and random.random() < spec['mixup_p']
+            if mixup:
+                lam = float(np.random.beta(MIXUP_ALPHA, MIXUP_ALPHA))
+                lam = max(lam, 1.0 - lam)
+                permutation = torch.randperm(len(images), device=DEVICE)
+                images = lam * images + (1.0 - lam) * images[permutation]
+            with amp_context():
+                logits = model(images)
+                loss = loss_fn(logits, targets)
+                if mixup:
+                    loss = lam * loss + (1.0 - lam) * loss_fn(logits, targets[permutation])
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            previous_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            if scaler.get_scale() >= previous_scale:
+                scheduler.step()
+                updates += 1
+                ema.decay = min(0.995, (1.0 + updates) / (10.0 + updates))
+                ema.update(model)
+            loss_sum = loss_sum + loss.detach() * len(images)
+            count += len(images)
+
+        improved, statistics = False, []
+        # 每轮对当前权重和 EMA 权重做翻转增强验证，保留表现更好的权重。
+        for source_name, candidate in (('live', model), ('ema', ema.module)):
+            probability = predict_probs(candidate, valid_loader, tta=True)
+            accuracy, nll = probability_metrics(probability, valid_labels)
+            statistics.append(f'{source_name}={accuracy:.4f}')
+            if (accuracy, -nll) > (best_accuracy, -best_nll):
+                best_accuracy, best_nll = accuracy, nll
+                best_state = {k: v.detach().cpu().clone() for k, v in candidate.state_dict().items()}
+                best_source, best_epoch = source_name, epoch + 1
+                improved = True
+        wait = 0 if improved else wait + 1
+        message = ' | '.join(statistics)
+        print(f'{model_name} Fold {fold} | Epoch {epoch+1:02d}/{EPOCHS} | '
+              f'loss={float(loss_sum)/max(1,count):.4f} | {message} | best={best_accuracy:.4f} | '
+              f'epoch_s={time.monotonic()-epoch_start:.1f}', flush=True)
+        if epoch + 1 >= MIN_EPOCHS and wait >= PATIENCE:
+            print(f'{model_name} Fold {fold}: early stopping', flush=True)
+            break
+
+    if best_state is None:
+        raise RuntimeError(f'No valid checkpoint for {model_name} fold {fold}')
+    model.load_state_dict(best_state)
+    weight_file = CACHE_DIR / f'{model_name}_fold{fold}_best.pth'
+    atomic_torch_save(dict(model=best_state, model_name=model_name, fold=fold,
+        epoch=best_epoch, source=best_source, image_size=IMG_SIZE, class_map=CLASS_MAP), weight_file)
+    del best_state, ema, optimizer, scheduler, scaler, train_loader
+    gc.collect()
+    valid_probability = predict_probs(model, valid_loader)
+    test_probability = predict_probs(model, test_loader)
+    if TRY_SHIFT_TTA:
+        print(f'{model_name} Fold {fold}: evaluating one-pixel shift TTA', flush=True)
+        valid_shift = predict_probs(model, valid_loader, shifts=SHIFT_OFFSETS)
+        test_shift = predict_probs(model, test_loader, shifts=SHIFT_OFFSETS)
+    else:
+        valid_shift, test_shift = valid_probability, test_probability
+    score, _ = probability_metrics(valid_probability, valid_labels)
+    temporary = result_path.with_suffix('.tmp.npz')
+    np.savez_compressed(temporary, valid_indices=valid_indices, valid_prob=valid_probability,
+        test_prob=test_probability, valid_shift=valid_shift, test_shift=test_shift,
+        score=np.asarray(score), checkpoint=np.asarray(weight_file.name))
+    os.replace(temporary, result_path)
+    print(f'{model_name} fold {fold} best validation accuracy: {score:.4f}; '
+          f'source={best_source}, epoch={best_epoch}, minutes={(time.monotonic()-start)/60:.1f}', flush=True)
+    del model, valid_loader, test_loader
+    gc.collect()
+    if DEVICE.type == 'cuda':
+        torch.cuda.empty_cache()
+    return str(result_path)
+
+
+def cache_images(paths, destination):
+    if destination.exists():
+        cached = np.load(destination, mmap_mode='r', allow_pickle=False)
+        if cached.shape == (len(paths), IMG_SIZE, IMG_SIZE) and cached.dtype == np.uint8:
+            return
+        raise RuntimeError(f'Unexpected image cache shape: {destination}')
+    temporary = destination.with_suffix('.tmp.npy')
+    images = np.lib.format.open_memmap(temporary, mode='w+', dtype=np.uint8,
+                                      shape=(len(paths), IMG_SIZE, IMG_SIZE))
+    def read(path):
+        value = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+        if value is None or value.shape != (IMG_SIZE, IMG_SIZE):
+            raise ValueError(f'Expected readable native 48x48 image: {path}')
+        return value
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for index, image in enumerate(pool.map(read, paths)):
+            images[index] = image
+    images.flush()
+    del images
+    os.replace(temporary, destination)
+
+
+def prepare_backbones(base_directory):
+    # 主进程先准备预训练权重，避免多个训练进程重复下载。
+    for model_name, spec in MODEL_SPECS.items():
+        path = base_directory / (model_name + '.pth')
+        if path.exists():
+            continue
+        print(f'Preparing ImageNet weights: {model_name}', flush=True)
+        try:
+            model = timm.create_model(model_name, pretrained=True, in_chans=3,
+                num_classes=0, global_pool='', drop_path_rate=spec['drop_path'])
+        except Exception as error:
+            raise RuntimeError(f'Pretrained weights unavailable for {model_name}; '
+                               'enable Kaggle Internet. No random-weight fallback.') from error
+        atomic_torch_save(model.state_dict(), path)
+        del model
+    gc.collect()
+
+
+
+
+
+
+
+
+def stable_improvement(reference, candidate, labels, fold_id, name):
+    ref_accuracy, ref_nll = probability_metrics(reference, labels)
+    accuracy, nll = probability_metrics(candidate, labels)
+    deltas = []
+    for fold in range(NUM_FOLDS):
+        mask = fold_id == fold
+        if not np.any(mask):
+            raise ValueError('Each fold must contain validation rows.')
+        before, _ = probability_metrics(reference[mask], labels[mask])
+        after, _ = probability_metrics(candidate[mask], labels[mask])
+        deltas.append(after - before)
+    accepted = (accuracy >= ref_accuracy + MIN_ENSEMBLE_GAIN
+                and nll <= ref_nll + 0.002 and min(deltas) >= -1e-12)
+    print(f'{name}: OOF={accuracy:.4f}, reference={ref_accuracy:.4f}, '
+          f'fold accuracy changes={[round(x, 4) for x in deltas]}, accepted={accepted}', flush=True)
+    return bool(accepted), dict(oof_accuracy=accuracy, reference_accuracy=ref_accuracy,
+        nll=nll, reference_nll=ref_nll, fold_accuracy_changes=deltas, accepted=bool(accepted))
+
+
+def choose_postprocessing(oof_by_model, test_by_model, oof_shift, test_shift, labels, fold_id):
+    # 使用预设的融合比例，根据折外预测评估候选方案，不使用测试标签。
+    baseline = 0.5 * (oof_by_model[0] + oof_by_model[1])
+    raw_accuracy, _ = probability_metrics(baseline, labels)
+    print(f'OOF accuracy: {raw_accuracy:.4f} (restored two-model baseline; v1 reference=0.6905)', flush=True)
+    weights = np.asarray([0.5, 0.5, 0.0], dtype=np.float64)
+    third_weights = np.asarray([(1-THIRD_MODEL_WEIGHT)/2,
+        (1-THIRD_MODEL_WEIGHT)/2, THIRD_MODEL_WEIGHT])
+    candidate = sum(w*p for w, p in zip(third_weights, oof_by_model))
+    use_third, third_details = stable_improvement(baseline, candidate, labels, fold_id, 'Third-model candidate')
+    if use_third:
+        weights = third_weights
+    selected_oof = sum(w*p for w, p in zip(weights, oof_by_model))
+    selected_test = sum(w*p for w, p in zip(weights, test_by_model))
+    use_shift, shift_details = False, None
+    if TRY_SHIFT_TTA:
+        shifted_oof = sum(w*p for w, p in zip(weights, oof_shift))
+        candidate = (1-SHIFT_BLEND_WEIGHT)*selected_oof + SHIFT_BLEND_WEIGHT*shifted_oof
+        use_shift, shift_details = stable_improvement(selected_oof, candidate, labels, fold_id, 'One-pixel TTA candidate')
+        if use_shift:
+            selected_oof = candidate
+            shifted_test = sum(w*p for w, p in zip(weights, test_shift))
+            selected_test = (1-SHIFT_BLEND_WEIGHT)*selected_test + SHIFT_BLEND_WEIGHT*shifted_test
+    final_accuracy, _ = probability_metrics(selected_oof, labels)
+    print(f'Final selected OOF diagnostic: {final_accuracy:.4f}; '
+          f'model weights={weights.tolist()}; shift TTA={use_shift}', flush=True)
+    print('OOF labels select checkpoints and inference options; this is a tuning '
+          'diagnostic, not an untouched test score or a Kaggle-score guarantee.', flush=True)
+    details = dict(baseline_oof_accuracy=raw_accuracy, selected_oof_accuracy=final_accuracy,
+        model_names=list(MODEL_NAMES), model_weights=weights.tolist(),
+        shift_tta_enabled=use_shift, shift_blend_weight=SHIFT_BLEND_WEIGHT if use_shift else 0.0,
+        third_model_diagnostic=third_details, shift_diagnostic=shift_details)
+    return selected_oof, selected_test, details
+
+
+def main():
+    start = time.monotonic()
+    cv2.setNumThreads(0)
+    gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    workers = min(MAX_GPU_WORKERS, gpu_count) if gpu_count else 1
+    if not gpu_count:
+        raise RuntimeError('Select a Kaggle GPU accelerator before starting this full training run.')
+    print(f'Device: cuda; visible GPUs={gpu_count}; parallel training workers={workers}', flush=True)
+    train_paths, train_labels, test_paths, test_names, train_hash = load_data(TRAIN_DIR, TEST_DIR)
+    labels = np.asarray(train_labels, dtype=np.int64)
+    if not train_paths or not test_paths or min(np.bincount(labels, minlength=6)) < NUM_FOLDS:
+        raise ValueError('Missing images or insufficient samples for five folds.')
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        test_hashes = list(pool.map(image_hash, test_paths))
+    # 把数据内容、顺序、源码和依赖版本纳入缓存标识，避免误用旧结果。
+    signature = hashlib.sha256()
+    signature.update(Path(__file__).read_bytes())
+    signature.update(json.dumps(dict(train=list(train_hash.items()),
+        train_names=train_paths, test=list(zip(test_names, test_hashes)),
+        torch=torch.__version__, timm=timm.__version__, albumentations=A.__version__),
+        sort_keys=True).encode())
+    cache_directory = WORK_ROOT / signature.hexdigest()[:16]
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    np.save(cache_directory / 'labels.npy', labels, allow_pickle=False)
+    cache_images(train_paths, cache_directory / 'train.npy')
+    cache_images(test_paths, cache_directory / 'test.npy')
+    base_directory = cache_directory / 'imagenet'
+    base_directory.mkdir(exist_ok=True)
+    prepare_backbones(base_directory)
+
+    split = StratifiedKFold(n_splits=NUM_FOLDS, shuffle=True, random_state=SEED)
+    jobs, fold_id = [], np.full(len(labels), -1, dtype=np.int64)
+    for fold, (train_indices, valid_indices) in enumerate(split.split(train_paths, labels), 1):
+        fold_id[valid_indices] = fold - 1
+        for model_name in MODEL_NAMES:
+            jobs.append((model_name, fold, train_indices, valid_indices))
+    print(f'Device: {"cuda" if gpu_count else "cpu"}; visible GPUs={gpu_count}; '
+          f'parallel training workers={workers}; folds={NUM_FOLDS}; models={MODEL_NAMES}', flush=True)
+    context = mp.get_context('spawn')
+    stop_event = context.Event()
+    device_queue = context.Queue()
+    for gpu in range(workers):
+        device_queue.put(gpu)
+    # 每个训练进程固定分配一张 GPU，避免多个进程占用同一张卡。
+    if workers == 1:
+        init_worker(device_queue, str(cache_directory), str(base_directory), stop_event)
+        result_paths = [train_job(job) for job in jobs]
+    else:
+        result_paths = []
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context,
+                initializer=init_worker,
+                initargs=(device_queue, str(cache_directory), str(base_directory), stop_event)) as pool:
+            futures = {pool.submit(train_job, job): (job[0], job[1]) for job in jobs}
+            try:
+                for future in as_completed(futures):
+                    result_paths.append(future.result())
+                    print(f'Completed {len(result_paths)}/{len(jobs)} training jobs; '
+                          f'elapsed={(time.monotonic()-start)/3600:.2f} hours', flush=True)
+            except BaseException:
+                stop_event.set()
+                for future in futures:
+                    future.cancel()
+                raise
+    device_queue.close()
+    device_queue.join_thread()
+
+    oof = [np.zeros((len(labels), 6), dtype=np.float32) for _ in MODEL_NAMES]
+    test = [np.zeros((len(test_paths), 6), dtype=np.float32) for _ in MODEL_NAMES]
+    oof_shift = [np.zeros_like(p) for p in oof]
+    test_shift = [np.zeros_like(p) for p in test]
+    scores = {name: [] for name in MODEL_NAMES}
+    covered = [np.zeros(len(labels), dtype=np.int64) for _ in MODEL_NAMES]
+    for model_index, model_name in enumerate(MODEL_NAMES):
+        for fold in range(1, NUM_FOLDS + 1):
+            path = cache_directory / f'{model_name}_fold{fold}.npz'
+            with np.load(path, allow_pickle=False) as result:
+                indices = result['valid_indices']
+                if result['valid_prob'].shape != (len(indices), 6) or result['test_prob'].shape != test[model_index].shape:
+                    raise RuntimeError('Unexpected prediction dimensions.')
+                oof[model_index][indices] = result['valid_prob']
+                oof_shift[model_index][indices] = result['valid_shift']
+                test_shift[model_index] += result['test_shift'] / NUM_FOLDS
+                covered[model_index][indices] += 1
+                test[model_index] += result['test_prob'] / NUM_FOLDS
+                scores[model_name].append(float(result['score']))
+        if not np.all(covered[model_index] == 1):
+            raise RuntimeError('Every training row must have exactly one held-out prediction per model.')
+        print(f'{model_name} fold validation accuracies: {scores[model_name]}', flush=True)
+    selected_oof, test_probability, recipe = choose_postprocessing(
+        oof, test, oof_shift, test_shift, labels, fold_id)
+    print(classification_report(labels, selected_oof.argmax(axis=1), labels=list(range(6)),
+          target_names=[INV_MAP[i] for i in range(6)], digits=4), flush=True)
+    np.savez_compressed(cache_directory / 'oof_and_test_probabilities.npz',
+        labels=labels, fold_id=fold_id, test_names=np.asarray(test_names),
+        model_names=np.asarray(MODEL_NAMES), oof_base=np.stack(oof),
+        test_base=np.stack(test), oof_shift=np.stack(oof_shift), test_shift=np.stack(test_shift),
+        selected_oof=selected_oof, selected_test=test_probability)
+    (cache_directory / 'ensemble_recipe.json').write_text(json.dumps(recipe, indent=2), encoding='utf-8')
+
+    final_labels = test_probability.argmax(axis=1).astype(int)
+    exact_match_count = 0
+    for i, h in enumerate(test_hashes):
+        if h in train_hash:
+            final_labels[i] = train_hash[h]
+            exact_match_count += 1
+    submission = pd.DataFrame({'ID': test_names, 'Emotion': final_labels})
+    if len(submission) != len(test_names) or not submission['Emotion'].between(0, 5).all():
+        raise RuntimeError('Invalid submission predictions.')
+    os.makedirs(os.path.dirname(SUBMISSION_PATH), exist_ok=True)
+    submission.to_csv(SUBMISSION_PATH, index=False)
+    print(f'Exact train/test image matches overridden: {exact_match_count}', flush=True)
+    print(f'Submission saved to: {SUBMISSION_PATH} | rows: {len(submission)}', flush=True)
+    print('Submission columns:', submission.columns.tolist(), flush=True)
+    print('Predicted class counts:\n', submission['Emotion'].value_counts().sort_index(), flush=True)
+    print(submission.head(), flush=True)
+    print(f'Model checkpoints and probabilities: {cache_directory}', flush=True)
+    print(f'Total wall time: {(time.monotonic()-start)/3600:.2f} hours', flush=True)
+
+
+if __name__ == '__main__':
+    main()
